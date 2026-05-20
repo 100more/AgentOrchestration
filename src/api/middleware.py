@@ -2,7 +2,8 @@
 
 import time
 import logging
-from typing import Callable
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Iterable, Optional, Set, Tuple
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -10,13 +11,200 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class CredentialRecord:
+    subject: str
+    workspace_id: str
+    workspace_role: str
+    scopes: Set[str] = field(default_factory=set)
+    expires_at: Optional[float] = None
+    revoked: bool = False
+    disabled: bool = False
+    client_type: str = "token"
+
+
+@dataclass(frozen=True)
+class Principal:
+    subject: str
+    workspace_id: str
+    workspace_role: str
+    scopes: Set[str]
+    client_type: str
+
+
+class PermissionService:
+    """Central credential revalidation for API and task-monitor clients."""
+
+    def __init__(self, allow_legacy_bearer: bool = True):
+        self.allow_legacy_bearer = allow_legacy_bearer
+        self._credentials: Dict[Tuple[str, str], CredentialRecord] = {}
+
+    def register_credential(
+        self,
+        token: str,
+        subject: str,
+        workspace_id: str,
+        workspace_role: str,
+        scopes: Iterable[str] = (),
+        expires_at: Optional[float] = None,
+        revoked: bool = False,
+        disabled: bool = False,
+        client_type: str = "token",
+    ) -> None:
+        self._credentials[(client_type, token)] = CredentialRecord(
+            subject=subject,
+            workspace_id=workspace_id,
+            workspace_role=workspace_role,
+            scopes=set(scopes),
+            expires_at=expires_at,
+            revoked=revoked,
+            disabled=disabled,
+            client_type=client_type,
+        )
+
+    def revoke_credential(
+        self, token: str, client_type: str = "token"
+    ) -> None:
+        record = self._credentials.get((client_type, token))
+        if record:
+            record.revoked = True
+
+    def authorize(
+        self,
+        request: Request,
+        required_scopes: Iterable[str] = (),
+        required_roles: Iterable[str] = (),
+        require_workspace: bool = False,
+        allow_legacy_bearer: Optional[bool] = None,
+    ) -> Tuple[Optional[Principal], int]:
+        principal, status_code = self.authenticate(
+            request, allow_legacy_bearer=allow_legacy_bearer
+        )
+        if principal is None:
+            return None, status_code
+
+        required_scope_set = set(required_scopes)
+        required_role_set = set(required_roles)
+        if (
+            required_scope_set
+            and "*" not in principal.scopes
+            and not required_scope_set.issubset(principal.scopes)
+        ):
+            return None, 403
+        if (
+            required_role_set
+            and principal.workspace_role not in required_role_set
+        ):
+            return None, 403
+        if require_workspace:
+            workspace_id = request.headers.get("X-Workspace-ID", "")
+            if not workspace_id or workspace_id != principal.workspace_id:
+                return None, 403
+
+        return principal, 200
+
+    def authenticate(
+        self,
+        request: Request,
+        allow_legacy_bearer: Optional[bool] = None,
+    ) -> Tuple[Optional[Principal], int]:
+        token, client_type = self._extract_token(request)
+        if not token or not client_type:
+            return None, 401
+
+        record = self._credentials.get((client_type, token))
+        if record is None:
+            allow_legacy = (
+                self.allow_legacy_bearer
+                if allow_legacy_bearer is None
+                else allow_legacy_bearer
+            )
+            if allow_legacy and client_type == "token":
+                return Principal(
+                    subject="legacy-token",
+                    workspace_id="",
+                    workspace_role="admin",
+                    scopes={"*"},
+                    client_type="token",
+                ), 200
+            return None, 401
+        if record.revoked or record.disabled:
+            return None, 401
+        if record.expires_at is not None and record.expires_at <= time.time():
+            return None, 401
+
+        return Principal(
+            subject=record.subject,
+            workspace_id=record.workspace_id,
+            workspace_role=record.workspace_role,
+            scopes=set(record.scopes),
+            client_type=record.client_type,
+        ), 200
+
+    def _extract_token(
+        self, request: Request
+    ) -> Tuple[Optional[str], Optional[str]]:
+        authorization = request.headers.get("Authorization", "")
+        if authorization:
+            scheme, separator, value = authorization.partition(" ")
+            if scheme != "Bearer" or not separator or not value.strip():
+                return None, None
+            return value.strip(), "token"
+
+        session_token = (
+            request.headers.get("X-Session-Token")
+            or request.cookies.get("ao_session")
+        )
+        if session_token and session_token.strip():
+            return session_token.strip(), "browser"
+
+        return None, None
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+    TASK_MONITOR_SCOPES = {"task_monitor:read"}
+    TASK_MONITOR_ROLES = {"owner", "admin", "operator"}
+
+    def __init__(
+        self, app, permission_service: Optional[PermissionService] = None
+    ):
+        super().__init__(app)
+        self.permission_service = permission_service or PermissionService()
+
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
+            if self._is_task_monitor_request(request):
+                principal, status_code = self.permission_service.authorize(
+                    request,
+                    required_scopes=self.TASK_MONITOR_SCOPES,
+                    required_roles=self.TASK_MONITOR_ROLES,
+                    require_workspace=True,
+                    allow_legacy_bearer=False,
+                )
+            else:
+                principal, status_code = self.permission_service.authorize(
+                    request
+                )
+
+            if principal is None:
+                content = "Forbidden" if status_code == 403 else "Unauthorized"
+                return Response(status_code=status_code, content=content)
+            request.state.principal = principal
         return await call_next(request)
+
+    def _is_task_monitor_request(self, request: Request) -> bool:
+        path = request.url.path.lower()
+        return (
+            "task-monitor" in path
+            or "task_monitor" in path
+            or path.endswith("/monitor")
+            or path.endswith("/monitor/poll")
+        )
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +214,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +235,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
