@@ -26,6 +26,10 @@ def build_client(permission_service):
     async def list_agents():
         return {"status": "ok"}
 
+    @app.get("/api/v2/task_monitor_data")
+    async def task_monitor_data():
+        return {"status": "legacy-ok"}
+
     return TestClient(app), calls
 
 
@@ -161,6 +165,18 @@ def test_regular_api_paths_keep_legacy_bearer_compatibility():
 
     response = client.get(
         "/api/v2/agents",
+        headers={"Authorization": "Bearer existing-token"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_non_monitor_path_with_monitor_in_name_keeps_legacy_compatibility():
+    service = PermissionService()
+    client, _ = build_client(service)
+
+    response = client.get(
+        "/api/v2/task_monitor_data",
         headers={"Authorization": "Bearer existing-token"},
     )
 

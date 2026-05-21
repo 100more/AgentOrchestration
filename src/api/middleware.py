@@ -164,6 +164,8 @@ class PermissionService:
 class AuthMiddleware(BaseHTTPMiddleware):
     TASK_MONITOR_SCOPES = {"task_monitor:read"}
     TASK_MONITOR_ROLES = {"owner", "admin", "operator"}
+    TASK_MONITOR_PREFIX = "/api/v2/tasks/"
+    TASK_MONITOR_SUFFIXES = ("/monitor", "/monitor/poll")
 
     def __init__(
         self, app, permission_service: Optional[PermissionService] = None
@@ -198,12 +200,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
     def _is_task_monitor_request(self, request: Request) -> bool:
-        path = request.url.path.lower()
+        path = request.url.path.lower().rstrip("/")
         return (
-            "task-monitor" in path
-            or "task_monitor" in path
-            or path.endswith("/monitor")
-            or path.endswith("/monitor/poll")
+            path.startswith(self.TASK_MONITOR_PREFIX)
+            and path.endswith(self.TASK_MONITOR_SUFFIXES)
         )
 
 
