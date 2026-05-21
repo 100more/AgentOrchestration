@@ -186,12 +186,12 @@ class TaskScheduler:
             expected_attempt is not None
             and task.get("attempt") != expected_attempt
         ):
-            return "stale_attempt"
+            return "stale_child_attempt"
         if (
             expected_revision is not None
             and task.get("revision") != expected_revision
         ):
-            return "stale_revision"
+            return "stale_child_revision"
         if self._is_cancelled(task.get("lifecycle_state")):
             return "task_cancelled"
 
@@ -261,6 +261,7 @@ class TaskScheduler:
             stored_parent_lifecycle = parent_state.get("lifecycle_state")
 
         self._retry_audit.append({
+            "decision": "retry_rejected",
             "reason": reason,
             "task_id": task.get("id"),
             "parent_id": parent_id,

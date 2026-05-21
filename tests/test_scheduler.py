@@ -6,6 +6,7 @@ from src.orchestrator.scheduler import TaskScheduler
 
 
 AUDIT_KEYS = {
+    "decision",
     "reason",
     "task_id",
     "parent_id",
@@ -27,6 +28,7 @@ class TestTaskScheduler:
 
     def assert_sanitized_audit(self, audit):
         assert set(audit) == AUDIT_KEYS
+        assert audit["decision"] == "retry_rejected"
         assert "payload" not in audit
         assert "config" not in audit
         assert "secret" not in audit
@@ -94,8 +96,8 @@ class TestTaskScheduler:
     @pytest.mark.parametrize(
         "guard, reason",
         [
-            ({"expected_attempt": 2}, "stale_attempt"),
-            ({"expected_revision": 9}, "stale_revision"),
+            ({"expected_attempt": 2}, "stale_child_attempt"),
+            ({"expected_revision": 9}, "stale_child_revision"),
         ],
     )
     def test_stale_child_retry_guard_rejects_without_incrementing_retries(
@@ -219,7 +221,7 @@ class TestTaskScheduler:
 
         audit = self.scheduler.retry_audit()
         assert len(audit) == 100
-        assert audit[-1]["reason"] == "stale_attempt"
+        assert audit[-1]["reason"] == "stale_child_attempt"
         self.assert_sanitized_audit(audit[-1])
 
 # 2019-01-09T19:07:03 update
