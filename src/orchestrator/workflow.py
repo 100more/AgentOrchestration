@@ -1,8 +1,72 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import hashlib
+import importlib
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 from uuid import uuid4
+
+import yaml
+
+
+def _node_ref(node_id: str) -> str:
+    return hashlib.sha256(node_id.encode()).hexdigest()[:12]
+
+
+def _step_ref(step_name: str) -> str:
+    return _node_ref(step_name)
+
+
+def _workflow_import_audit_event(
+    *, node_ref: str, decision: str, reason: str
+) -> Dict[str, object]:
+    return {
+        "event": "workflow_yaml_import_node",
+        "node_ref": node_ref,
+        "decision": decision,
+        "reason": reason,
+    }
+
+
+def _compensation_audit_event(
+    *,
+    workflow_id: str,
+    step_ref: str,
+    compensation_event: str,
+    reason: str,
+) -> Dict[str, object]:
+    return {
+        "event": "workflow_compensation",
+        "workflow_id": workflow_id,
+        "step_ref": step_ref,
+        "compensation_event": compensation_event,
+        "reason": reason,
+    }
+
+
+@dataclass(frozen=True)
+class CompensationContext:
+    step_ref: str
+    reason: str
+    position: int
+
+
+class WorkflowError(ValueError):
+    pass
+
+
+class DuplicateNodeError(ValueError):
+    def __init__(self, node_id: str, context: str = ""):
+        self.node_id_ref = _node_ref(node_id)
+        if context:
+            message = (
+                f"duplicate node identifier in {context}: "
+                f"{self.node_id_ref}"
+            )
+        else:
+            message = f"duplicate node identifier: {self.node_id_ref}"
+        super().__init__(message)
 
 
 class StepStatus(Enum):
@@ -11,15 +75,28 @@ class StepStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    COMPENSATED = "compensated"
+    COMPENSATION_FAILED = "compensation_failed"
+    BLOCKED = "blocked"
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        compensator: Optional[Callable] = None,
+        retriable_exceptions: Tuple[Type[Exception], ...] = (),
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.compensator = compensator
+        self.retriable_exceptions = retriable_exceptions
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,14 +110,42 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self._node_ids: set[str] = set()
+        self.import_audit_log: List[Dict[str, object]] = []
+        self.compensation_audit_log: List[Dict[str, object]] = []
+        self.is_blocked: bool = False
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        node_ref = _node_ref(step.name)
+        if step.name in self._node_ids:
+            self.import_audit_log.append(
+                _workflow_import_audit_event(
+                    node_ref=node_ref,
+                    decision="rejected",
+                    reason="duplicate_node_id",
+                )
+            )
+            raise DuplicateNodeError(step.name)
+        self._node_ids.add(step.name)
         self.steps.append(step)
         self._step_map[step.id] = step
+        self.import_audit_log.append(
+            _workflow_import_audit_event(
+                node_ref=node_ref,
+                decision="accepted",
+                reason="node_registered",
+            )
+        )
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
         return self._step_map.get(step_id)
+
+    def block(self, reason: str) -> None:
+        if self.is_blocked:
+            return
+        self.is_blocked = True
+        self.status = StepStatus.FAILED
 
 
 class WorkflowManager:
@@ -61,26 +166,241 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def register_from_yaml(
+        self,
+        yaml_str: str,
+        import_resolver: Optional[Dict[str, str]] = None,
+    ) -> Workflow:
+        definition = self._load_yaml_definition(yaml_str)
+        workflow_name = str(definition.get("name") or "workflow")
+        description = str(definition.get("description") or "")
+        import_resolver = import_resolver or {}
+
+        imported_nodes: List[Dict[str, object]] = []
+        for import_entry in definition.get("imports", []) or []:
+            import_name, node_filter = self._parse_import_entry(import_entry)
+            if import_name == workflow_name:
+                raise WorkflowError(f"self_import: {import_name}")
+            if import_name not in import_resolver:
+                raise WorkflowError(f"unresolved_import: {import_name}")
+
+            import_definition = self._load_yaml_definition(
+                import_resolver[import_name]
+            )
+            nodes = self._extract_node_definitions(import_definition)
+            if node_filter is not None:
+                allowed = set(node_filter)
+                nodes = [
+                    node for node in nodes
+                    if self._node_name(node) in allowed
+                ]
+            imported_nodes.extend(nodes)
+
+        local_nodes = self._extract_node_definitions(definition)
+        workflow = self.create_workflow(workflow_name, description)
+        try:
+            for node in imported_nodes + local_nodes:
+                workflow.add_step(self._step_from_node(node))
+        except DuplicateNodeError:
+            self.delete_workflow(workflow.id)
+            raise
+        return workflow
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
+        if workflow.is_blocked:
+            return False
 
         workflow.status = StepStatus.RUNNING
+        completed_steps: List[WorkflowStep] = []
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
+                completed_steps.append(step)
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
+                if type(e) in step.retriable_exceptions:
+                    workflow.status = StepStatus.FAILED
+                    return False
+                self._run_compensation(workflow, completed_steps)
+                self._block_downstream_steps(workflow)
                 workflow.status = StepStatus.FAILED
                 return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _run_compensation(
+        self,
+        workflow: Workflow,
+        completed_steps: List[WorkflowStep],
+    ) -> bool:
+        partial_rollback = False
+        attempted = False
+
+        for position, step in enumerate(reversed(completed_steps)):
+            if step.status in (
+                StepStatus.COMPENSATED,
+                StepStatus.COMPENSATION_FAILED,
+            ):
+                continue
+            if step.status != StepStatus.COMPLETED:
+                continue
+
+            attempted = True
+            step_ref = _step_ref(step.name)
+            ctx = CompensationContext(
+                step_ref=step_ref,
+                reason="compensating_after_failure",
+                position=position,
+            )
+
+            if step.compensator is None:
+                step.status = StepStatus.COMPENSATED
+                workflow.compensation_audit_log.append(
+                    _compensation_audit_event(
+                        workflow_id=workflow.id,
+                        step_ref=step_ref,
+                        compensation_event="no_compensator",
+                        reason="skipped",
+                    )
+                )
+                continue
+
+            try:
+                try:
+                    step.compensator(ctx)
+                except TypeError:
+                    step.compensator()
+                step.status = StepStatus.COMPENSATED
+                workflow.compensation_audit_log.append(
+                    _compensation_audit_event(
+                        workflow_id=workflow.id,
+                        step_ref=step_ref,
+                        compensation_event="compensated",
+                        reason="ok",
+                    )
+                )
+            except Exception:
+                step.status = StepStatus.COMPENSATION_FAILED
+                partial_rollback = True
+                workflow.compensation_audit_log.append(
+                    _compensation_audit_event(
+                        workflow_id=workflow.id,
+                        step_ref=step_ref,
+                        compensation_event="compensation_failed",
+                        reason="compensator_raised",
+                    )
+                )
+
+        if not attempted and completed_steps:
+            return True
+
+        workflow.compensation_audit_log.append(
+            _compensation_audit_event(
+                workflow_id=workflow.id,
+                step_ref="workflow",
+                compensation_event=(
+                    "partial_rollback" if partial_rollback
+                    else "rollback_complete"
+                ),
+                reason="all_compensators_attempted",
+            )
+        )
+        workflow.block(
+            "partial_rollback" if partial_rollback else "full_rollback"
+        )
+        return not partial_rollback
+
+    def _block_downstream_steps(self, workflow: Workflow) -> None:
+        for step in workflow.steps:
+            if step.status != StepStatus.PENDING:
+                continue
+            step.status = StepStatus.BLOCKED
+            workflow.compensation_audit_log.append(
+                _compensation_audit_event(
+                    workflow_id=workflow.id,
+                    step_ref=_step_ref(step.name),
+                    compensation_event="downstream_blocked",
+                    reason="post_rollback_block",
+                )
+            )
+
+    def _load_yaml_definition(self, yaml_str: str) -> Dict[str, object]:
+        definition = yaml.safe_load(yaml_str) or {}
+        if not isinstance(definition, dict):
+            raise WorkflowError("invalid_workflow_definition")
+        return definition
+
+    def _parse_import_entry(
+        self, import_entry: object
+    ) -> tuple[str, Optional[List[str]]]:
+        if isinstance(import_entry, str):
+            return import_entry, None
+        if not isinstance(import_entry, dict):
+            raise WorkflowError("invalid_import")
+        import_name = import_entry.get("name")
+        if not isinstance(import_name, str) or not import_name:
+            raise WorkflowError("invalid_import")
+        nodes = import_entry.get("nodes")
+        if nodes is None:
+            return import_name, None
+        if not isinstance(nodes, list):
+            raise WorkflowError("invalid_import")
+        return import_name, [str(node) for node in nodes]
+
+    def _extract_node_definitions(
+        self, definition: Dict[str, object]
+    ) -> List[Dict[str, object]]:
+        raw_nodes = definition.get("steps", definition.get("nodes", [])) or []
+        if not isinstance(raw_nodes, list):
+            raise WorkflowError("invalid_nodes")
+
+        nodes = []
+        for raw_node in raw_nodes:
+            if isinstance(raw_node, str):
+                nodes.append({"id": raw_node})
+            elif isinstance(raw_node, dict):
+                nodes.append(dict(raw_node))
+            else:
+                raise WorkflowError("invalid_node")
+        return nodes
+
+    def _node_name(self, node: Dict[str, object]) -> str:
+        node_name = node.get("id", node.get("name"))
+        if not isinstance(node_name, str) or not node_name:
+            raise WorkflowError("invalid_node")
+        return node_name
+
+    def _step_from_node(self, node: Dict[str, object]) -> WorkflowStep:
+        return WorkflowStep(
+            self._node_name(node),
+            self._resolve_handler(node.get("handler")),
+            retries=int(node.get("retries", 0) or 0),
+            timeout=int(node.get("timeout", 300) or 300),
+        )
+
+    def _resolve_handler(self, handler_ref: object) -> Callable:
+        if callable(handler_ref):
+            return handler_ref
+        if not isinstance(handler_ref, str) or "." not in handler_ref:
+            return lambda: None
+
+        module_name, _, attr_name = handler_ref.rpartition(".")
+        try:
+            module = importlib.import_module(module_name)
+            handler = getattr(module, attr_name)
+        except (ImportError, AttributeError):
+            return lambda: None
+        if not callable(handler):
+            return lambda: None
+        return handler
 
 # 2019-03-27T19:58:07 update
 
