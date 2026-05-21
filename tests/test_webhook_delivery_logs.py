@@ -22,6 +22,31 @@ PRIVATE_VALUES = {
     "trace-secret",
 }
 
+AUDIT_KEYS = {
+    "decision",
+    "reason",
+    "workspace_id",
+    "endpoint_id",
+    "event_id",
+    "attempt",
+    "status",
+    "retry_after",
+}
+
+FORBIDDEN_AUDIT_KEYS = {
+    "authorization",
+    "callback_payload",
+    "config",
+    "endpoint",
+    "headers",
+    "payload",
+    "raw_payload",
+    "response",
+    "secret",
+    "signing_secret",
+    "token",
+}
+
 
 class FakeClock:
     def __init__(self, now=1000.0):
@@ -32,6 +57,21 @@ class FakeClock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+def assert_fixed_audit(record, decision, reason):
+    audit = record.audit
+    assert set(audit) == AUDIT_KEYS
+    assert audit["decision"] == decision
+    assert audit["reason"] == reason
+    assert audit["workspace_id"] == record.workspace_id
+    assert audit["endpoint_id"] == record.endpoint_id
+    assert audit["event_id"] == record.event_id
+    assert audit["attempt"] == record.attempt
+    assert audit["status"] == record.status
+    assert record.callback_payload["audit"] == audit
+    assert not (set(audit) & FORBIDDEN_AUDIT_KEYS)
+    assert not contains_private_values(audit, PRIVATE_VALUES)
 
 
 def test_valid_delivery_redacts_records_and_callbacks():
@@ -82,6 +122,7 @@ def test_valid_delivery_redacts_records_and_callbacks():
         "token=%5BREDACTED%5D&safe=1"
     )
     assert record.callback_payload["payload"] == record.payload
+    assert_fixed_audit(record, "delivery_accepted", "accepted")
     assert not contains_private_values(record.to_dict(), PRIVATE_VALUES)
 
 
@@ -192,6 +233,7 @@ def test_workspace_isolation_does_not_expose_foreign_endpoint_metadata():
     assert record.reason == "endpoint_not_found"
     assert record.endpoint == {"id": endpoint.id}
     assert record.payload == {"secret": REDACTED, "message": "visible"}
+    assert_fixed_audit(record, "delivery_rejected", "workspace_isolated")
     assert "workspace-a" not in repr(record.callback_payload)
     assert "hooks.example.test" not in repr(record.callback_payload)
     assert not contains_private_values(record.to_dict(), PRIVATE_VALUES)
@@ -303,10 +345,13 @@ def test_retry_attempts_do_not_double_count_rate_limit_bucket():
     assert first.status == "delivered"
     assert retry.status == "retry_scheduled"
     assert retry.reason == "retry_scheduled"
+    assert_fixed_audit(retry, "retry_reused", "retry_reused")
     assert duplicate_retry.id == retry.id
     assert duplicate_retry.payload == {"attempt": 2}
+    assert duplicate_retry.audit == retry.audit
     assert unrelated.status == "rejected"
     assert unrelated.reason == "endpoint_rate_limited"
+    assert_fixed_audit(unrelated, "delivery_rejected", "rate_limited")
     assert later.status == "delivered"
     assert calls == [endpoint.id, endpoint.id]
 
@@ -396,8 +441,10 @@ def test_rate_limited_records_strip_raw_payload_before_persistence():
     )
 
     assert limited.reason == "endpoint_rate_limited"
+    assert_fixed_audit(limited, "delivery_rejected", "rate_limited")
     assert stored["payload"] == {"message": "visible"}
     assert stored["headers"]["Authorization"] == REDACTED
+    assert stored["audit"] == limited.audit
     assert not contains_private_values(stored, PRIVATE_VALUES)
 
 

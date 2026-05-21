@@ -11,6 +11,19 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REDACTED = "[REDACTED]"
 
+AUDIT_DECISION_ACCEPTED = "delivery_accepted"
+AUDIT_DECISION_REJECTED = "delivery_rejected"
+AUDIT_DECISION_REUSED = "retry_reused"
+
+AUDIT_REASON_ACCEPTED = "accepted"
+AUDIT_REASON_DELIVERY_FAILED = "delivery_failed"
+AUDIT_REASON_ENDPOINT_DISABLED = "endpoint_disabled"
+AUDIT_REASON_ENDPOINT_ROTATED = "endpoint_rotated"
+AUDIT_REASON_RATE_LIMITED = "rate_limited"
+AUDIT_REASON_RETRY_REUSED = "retry_reused"
+AUDIT_REASON_RETRY_SCHEDULED = "retry_scheduled"
+AUDIT_REASON_WORKSPACE_ISOLATED = "workspace_isolated"
+
 SENSITIVE_NAME_PARTS = (
     "api_key",
     "apikey",
@@ -74,6 +87,7 @@ class DeliveryRecord:
     response: Dict[str, Any]
     endpoint: Dict[str, Any]
     callback_payload: Dict[str, Any]
+    audit: Dict[str, Any]
     retry_after: Optional[int] = None
     created_at: float = field(default_factory=time.time)
 
@@ -91,6 +105,7 @@ class DeliveryRecord:
             "response": copy.deepcopy(self.response),
             "endpoint": copy.deepcopy(self.endpoint),
             "callback_payload": copy.deepcopy(self.callback_payload),
+            "audit": copy.deepcopy(self.audit),
             "created_at": self.created_at,
         }
         if self.retry_after is not None:
@@ -121,7 +136,7 @@ class EndpointRateLimiter:
         self,
         endpoint: WebhookEndpoint,
         event_id: str,
-    ) -> Tuple[bool, Optional[int]]:
+    ) -> Tuple[bool, Optional[int], bool]:
         now = self._clock()
         bucket_key = (endpoint.workspace_id, endpoint.id)
         event_key = (endpoint.workspace_id, endpoint.id, event_id)
@@ -132,17 +147,17 @@ class EndpointRateLimiter:
                 endpoint.window_seconds,
                 now,
             )
-            return True, None
+            return True, None, True
 
         hits = self._active_hits(bucket_key, endpoint.window_seconds, now)
         if len(hits) >= endpoint.max_deliveries:
             retry_after = endpoint.window_seconds - (now - hits[0][0])
             self._hits[bucket_key] = hits
-            return False, max(1, math.ceil(retry_after))
+            return False, max(1, math.ceil(retry_after)), False
 
         self._hits[bucket_key] = [*hits, (now, event_id)]
         self._charged_events.add(event_key)
-        return True, None
+        return True, None, False
 
     def reset(self) -> None:
         self._hits.clear()
@@ -386,21 +401,25 @@ class WebhookDeliveryService:
         reason = requested_reason
         include_endpoint_workspace = True
         retry_after: Optional[int] = None
+        audit_reason = _audit_reason_for_status(status, reason)
 
         if endpoint is None:
             status = "rejected"
             reason = "endpoint_not_found"
+            audit_reason = AUDIT_REASON_WORKSPACE_ISOLATED
             endpoint_info = {"id": endpoint_id}
         else:
             if not endpoint.enabled:
                 status = "rejected"
                 reason = "endpoint_disabled"
+                audit_reason = AUDIT_REASON_ENDPOINT_DISABLED
             elif (
                 endpoint_version is not None
                 and endpoint.version != endpoint_version
             ):
                 status = "rejected"
                 reason = "endpoint_rotated"
+                audit_reason = AUDIT_REASON_ENDPOINT_ROTATED
             endpoint_info = endpoint.public_dict(
                 include_workspace=include_endpoint_workspace
             )
@@ -410,10 +429,16 @@ class WebhookDeliveryService:
         sanitized_response = redact_delivery_value(response or {})
 
         if endpoint is not None and status != "rejected":
-            allowed, retry_after = self._limiter.allow(endpoint, event_id)
+            allowed, retry_after, reused_charge = self._limiter.allow(
+                endpoint,
+                event_id,
+            )
             if not allowed:
                 status = "rejected"
                 reason = "endpoint_rate_limited"
+                audit_reason = AUDIT_REASON_RATE_LIMITED
+            elif reused_charge:
+                audit_reason = AUDIT_REASON_RETRY_REUSED
             elif requested_status == "delivered":
                 sender_response = self._delivery_sender(
                     copy.deepcopy(endpoint),
@@ -424,12 +449,22 @@ class WebhookDeliveryService:
                         sender_response
                     )
 
+        audit = _delivery_audit(
+            workspace_id=workspace_id,
+            endpoint_id=endpoint_id,
+            event_id=event_id,
+            attempt=attempt,
+            status=status,
+            reason=audit_reason,
+            retry_after=retry_after,
+        )
         callback_payload = {
             "endpoint_id": endpoint_id,
             "event_id": event_id,
             "attempt": attempt,
             "status": status,
             "reason": reason,
+            "audit": copy.deepcopy(audit),
             "payload": copy.deepcopy(sanitized_payload),
             "response": copy.deepcopy(sanitized_response),
         }
@@ -450,6 +485,7 @@ class WebhookDeliveryService:
             response=sanitized_response,
             endpoint=endpoint_info,
             callback_payload=callback_payload,
+            audit=audit,
             retry_after=retry_after,
         )
         self._records[key] = record
@@ -497,6 +533,42 @@ def sanitize_headers(headers: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             else redact_delivery_value(value)
         )
     return sanitized
+
+
+def _audit_reason_for_status(status: str, reason: str) -> str:
+    if status == "failed" or reason == "delivery_failed":
+        return AUDIT_REASON_DELIVERY_FAILED
+    if status == "retry_scheduled" or reason == "retry_scheduled":
+        return AUDIT_REASON_RETRY_SCHEDULED
+    return AUDIT_REASON_ACCEPTED
+
+
+def _delivery_audit(
+    workspace_id: str,
+    endpoint_id: str,
+    event_id: str,
+    attempt: int,
+    status: str,
+    reason: str,
+    retry_after: Optional[int],
+) -> Dict[str, Any]:
+    if reason == AUDIT_REASON_RETRY_REUSED:
+        decision = AUDIT_DECISION_REUSED
+    elif status == "rejected":
+        decision = AUDIT_DECISION_REJECTED
+    else:
+        decision = AUDIT_DECISION_ACCEPTED
+
+    return {
+        "decision": decision,
+        "reason": reason,
+        "workspace_id": workspace_id,
+        "endpoint_id": endpoint_id,
+        "event_id": event_id,
+        "attempt": attempt,
+        "status": status,
+        "retry_after": retry_after,
+    }
 
 
 def redact_delivery_value(value: Any) -> Any:
