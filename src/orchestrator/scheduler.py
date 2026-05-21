@@ -1,10 +1,13 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+
+CANCELLED_LIFECYCLES = {"cancelled", "canceled", "cancelling", "canceling"}
+RETRY_AUDIT_LIMIT = 100
 
 
 class PriorityQueue:
@@ -35,26 +38,55 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._task_state: Dict[str, Dict[str, Any]] = {}
+        self._retry_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task.setdefault("retries", 0)
+        task.setdefault("attempt", task["retries"])
+        task.setdefault("revision", 0)
+        task.setdefault("lifecycle_state", "queued")
 
+        self._record_task_state(task_id, task)
+        self._push_task(task, queue, priority)
+        return task_id
+
+    def _push_task(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> None:
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -65,21 +97,222 @@ class TaskScheduler:
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
             if task:
+                task["lifecycle_state"] = "running"
+                self._record_task_state(task["id"], task)
                 self._in_flight[task["id"]] = task
                 return task
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if task is None:
+            return False
+        task["lifecycle_state"] = "completed"
+        self._record_task_state(task_id, task)
+        return True
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
+    def cancel(self, task_id: str) -> bool:
+        task = self._in_flight.pop(task_id, None)
+        if task is not None:
+            task["lifecycle_state"] = "cancelled"
+            self._record_task_state(task_id, task)
+            return True
+
+        state = self._task_state.get(task_id)
+        if state is None:
+            return False
+        state["lifecycle_state"] = "cancelled"
+        return True
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        *,
+        expected_attempt: Optional[int] = None,
+        expected_revision: Optional[int] = None,
+        expected_parent_attempt: Optional[int] = None,
+        expected_parent_revision: Optional[int] = None,
+        parent_lifecycle: Optional[str] = None,
+    ) -> bool:
+        task = self._in_flight.get(task_id)
+        rejection_reason = self._retry_rejection_reason(
+            task,
+            expected_attempt,
+            expected_revision,
+            expected_parent_attempt,
+            expected_parent_revision,
+            parent_lifecycle,
+        )
+        if rejection_reason:
+            self._reject_retry(task, rejection_reason, parent_lifecycle)
+            return False
+
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                task["attempt"] = task.get("attempt", 0) + 1
+                task["revision"] = task.get("revision", 0) + 1
+                task["enqueued_at"] = time.time()
+                task["lifecycle_state"] = "queued"
+                self._record_task_state(task_id, task)
+                self._push_task(task, queue, priority=task.get("priority", 0))
                 return True
+            task["lifecycle_state"] = "failed"
+            self._record_task_state(task_id, task)
         return False
+
+    def get_task_state(self, task_id: str) -> Optional[Dict[str, Any]]:
+        state = self._task_state.get(task_id)
+        return dict(state) if state else None
+
+    def retry_audit(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._retry_audit]
+
+    def _retry_rejection_reason(
+        self,
+        task: Optional[Dict],
+        expected_attempt: Optional[int],
+        expected_revision: Optional[int],
+        expected_parent_attempt: Optional[int],
+        expected_parent_revision: Optional[int],
+        parent_lifecycle: Optional[str],
+    ) -> Optional[str]:
+        if task is None:
+            return None
+
+        if (
+            expected_attempt is not None
+            and task.get("attempt") != expected_attempt
+        ):
+            return "stale_attempt"
+        if (
+            expected_revision is not None
+            and task.get("revision") != expected_revision
+        ):
+            return "stale_revision"
+        if self._is_cancelled(task.get("lifecycle_state")):
+            return "task_cancelled"
+
+        task_parent_lifecycle = task.get("parent_lifecycle_state")
+        if self._is_cancelled(parent_lifecycle):
+            return "parent_cancelled"
+        if self._is_cancelled(task_parent_lifecycle):
+            return "parent_cancelled"
+
+        parent_id = self._parent_id(task)
+        parent_state = self._task_state.get(parent_id)
+        if parent_state and self._is_cancelled(
+            parent_state.get("lifecycle_state"),
+        ):
+            return "parent_cancelled"
+
+        expected_parent_attempt = self._first_not_none(
+            expected_parent_attempt,
+            task.get("parent_attempt"),
+        )
+        expected_parent_revision = self._first_not_none(
+            expected_parent_revision,
+            task.get("parent_revision"),
+        )
+        if expected_parent_attempt is not None:
+            if parent_state is None:
+                return "missing_parent_state"
+            if parent_state.get("attempt") != expected_parent_attempt:
+                return "stale_parent_attempt"
+        if expected_parent_revision is not None:
+            if parent_state is None:
+                return "missing_parent_state"
+            if parent_state.get("revision") != expected_parent_revision:
+                return "stale_parent_revision"
+        return None
+
+    def _reject_retry(
+        self,
+        task: Dict,
+        reason: str,
+        parent_lifecycle: Optional[str],
+    ) -> None:
+        if reason in {"parent_cancelled", "task_cancelled"}:
+            self._in_flight.pop(task["id"], None)
+            task["lifecycle_state"] = "cancelled"
+            self._record_task_state(task["id"], task)
+        self._record_retry_audit(task, reason, parent_lifecycle)
+
+    def _record_task_state(self, task_id: str, task: Dict) -> None:
+        self._task_state[task_id] = {
+            "attempt": task.get("attempt"),
+            "revision": task.get("revision"),
+            "retries": task.get("retries"),
+            "lifecycle_state": task.get("lifecycle_state"),
+        }
+
+    def _record_retry_audit(
+        self,
+        task: Dict,
+        reason: str,
+        parent_lifecycle: Optional[str],
+    ) -> None:
+        parent_id = self._parent_id(task)
+        parent_state = self._task_state.get(parent_id)
+        stored_parent_lifecycle = None
+        if parent_state:
+            stored_parent_lifecycle = parent_state.get("lifecycle_state")
+
+        self._retry_audit.append({
+            "reason": reason,
+            "task_id": task.get("id"),
+            "parent_id": parent_id,
+            "attempt": task.get("attempt"),
+            "revision": task.get("revision"),
+            "lifecycle_state": task.get("lifecycle_state"),
+            "parent_attempt": self._parent_attempt(task, parent_state),
+            "parent_revision": self._parent_revision(task, parent_state),
+            "parent_lifecycle_state": (
+                task.get("parent_lifecycle_state")
+                or parent_lifecycle
+                or stored_parent_lifecycle
+            ),
+        })
+        self._retry_audit = self._retry_audit[-RETRY_AUDIT_LIMIT:]
+
+    @staticmethod
+    def _parent_id(task: Dict) -> Optional[str]:
+        return task.get("parent_id") or task.get("parent_task_id")
+
+    @staticmethod
+    def _parent_attempt(
+        task: Dict,
+        parent_state: Optional[Dict[str, Any]],
+    ) -> Optional[int]:
+        if task.get("parent_attempt") is not None:
+            return task.get("parent_attempt")
+        if parent_state:
+            return parent_state.get("attempt")
+        return None
+
+    @staticmethod
+    def _parent_revision(
+        task: Dict,
+        parent_state: Optional[Dict[str, Any]],
+    ) -> Optional[int]:
+        if task.get("parent_revision") is not None:
+            return task.get("parent_revision")
+        if parent_state:
+            return parent_state.get("revision")
+        return None
+
+    @staticmethod
+    def _is_cancelled(lifecycle: Optional[str]) -> bool:
+        return lifecycle in CANCELLED_LIFECYCLES
+
+    @staticmethod
+    def _first_not_none(
+        left: Optional[int],
+        right: Optional[int],
+    ) -> Optional[int]:
+        return left if left is not None else right
 
 # 2019-04-25T08:37:12 update
 

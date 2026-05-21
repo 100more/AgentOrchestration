@@ -1,10 +1,36 @@
+import asyncio
+
 import pytest
+
 from src.orchestrator.scheduler import TaskScheduler
+
+
+AUDIT_KEYS = {
+    "reason",
+    "task_id",
+    "parent_id",
+    "attempt",
+    "revision",
+    "lifecycle_state",
+    "parent_attempt",
+    "parent_revision",
+    "parent_lifecycle_state",
+}
 
 
 class TestTaskScheduler:
     def setup_method(self):
         self.scheduler = TaskScheduler()
+
+    def dequeue(self):
+        return asyncio.run(self.scheduler.dequeue())
+
+    def assert_sanitized_audit(self, audit):
+        assert set(audit) == AUDIT_KEYS
+        assert "payload" not in audit
+        assert "config" not in audit
+        assert "secret" not in audit
+        assert "token" not in audit
 
     def test_enqueue_task(self):
         task_id = self.scheduler.enqueue({"type": "test", "payload": {}})
@@ -12,29 +38,189 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
+        task = self.dequeue()
         assert task is not None
         assert task["type"] == "test"
 
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
+        task = self.dequeue()
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
+        task = self.dequeue()
         assert self.scheduler.complete(task["id"])
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
+        task = self.dequeue()
         assert self.scheduler.fail(task["id"])
+
+    def test_parent_cancelled_before_child_failure_rejects_child_retry(self):
+        parent_id = self.scheduler.enqueue({"type": "parent"})
+        parent = self.dequeue()
+        assert parent["id"] == parent_id
+        assert self.scheduler.cancel(parent_id)
+
+        child_id = self.scheduler.enqueue({
+            "type": "child",
+            "parent_id": parent_id,
+            "payload": {"token": "do-not-audit"},
+        })
+        child = self.dequeue()
+
+        assert child["id"] == child_id
+        assert not self.scheduler.fail(child_id)
+        assert child["retries"] == 0
+        assert self.dequeue() is None
+        assert (
+            self.scheduler.get_task_state(parent_id)["lifecycle_state"]
+            == "cancelled"
+        )
+        assert (
+            self.scheduler.get_task_state(child_id)["lifecycle_state"]
+            == "cancelled"
+        )
+
+        audit = self.scheduler.retry_audit()[-1]
+        self.assert_sanitized_audit(audit)
+        assert audit["reason"] == "parent_cancelled"
+        assert audit["task_id"] == child_id
+        assert audit["parent_id"] == parent_id
+        assert audit["parent_lifecycle_state"] == "cancelled"
+
+    @pytest.mark.parametrize(
+        "guard, reason",
+        [
+            ({"expected_attempt": 2}, "stale_attempt"),
+            ({"expected_revision": 9}, "stale_revision"),
+        ],
+    )
+    def test_stale_child_retry_guard_rejects_without_incrementing_retries(
+        self,
+        guard,
+        reason,
+    ):
+        task_id = self.scheduler.enqueue({
+            "type": "child",
+            "attempt": 1,
+            "revision": 3,
+        })
+        task = self.dequeue()
+
+        assert not self.scheduler.fail(task_id, **guard)
+        assert task["retries"] == 0
+        assert task["attempt"] == 1
+        assert task["revision"] == 3
+        assert (
+            self.scheduler.get_task_state(task_id)["lifecycle_state"]
+            == "running"
+        )
+        assert self.dequeue() is None
+
+        audit = self.scheduler.retry_audit()[-1]
+        self.assert_sanitized_audit(audit)
+        assert audit["reason"] == reason
+        assert audit["task_id"] == task_id
+        assert audit["attempt"] == 1
+        assert audit["revision"] == 3
+        assert audit["lifecycle_state"] == "running"
+
+    @pytest.mark.parametrize(
+        "task_snapshot, fail_snapshot",
+        [
+            ("cancelled", None),
+            (None, "cancelling"),
+        ],
+    )
+    def test_cancelled_parent_snapshot_rejects_child_retry(
+        self,
+        task_snapshot,
+        fail_snapshot,
+    ):
+        child = {
+            "type": "child",
+            "parent_id": "parent-from-snapshot",
+        }
+        if task_snapshot is not None:
+            child["parent_lifecycle_state"] = task_snapshot
+        child_id = self.scheduler.enqueue(child)
+        child = self.dequeue()
+
+        assert child["id"] == child_id
+        assert not self.scheduler.fail(
+            child_id,
+            parent_lifecycle=fail_snapshot,
+        )
+        assert (
+            self.scheduler.get_task_state(child_id)["lifecycle_state"]
+            == "cancelled"
+        )
+        assert self.dequeue() is None
+
+        audit = self.scheduler.retry_audit()[-1]
+        self.assert_sanitized_audit(audit)
+        assert audit["reason"] == "parent_cancelled"
+        assert audit["parent_id"] == "parent-from-snapshot"
+        assert audit["parent_lifecycle_state"] == (
+            task_snapshot or fail_snapshot
+        )
+
+    def test_stale_parent_revision_rejects_without_incrementing_retries(self):
+        parent_id = self.scheduler.enqueue({"type": "parent"})
+        parent = self.dequeue()
+        assert self.scheduler.complete(parent["id"])
+
+        child_id = self.scheduler.enqueue({
+            "type": "child",
+            "parent_id": parent_id,
+            "parent_revision": 4,
+        })
+        child = self.dequeue()
+
+        assert not self.scheduler.fail(child_id)
+        assert child["retries"] == 0
+        assert (
+            self.scheduler.get_task_state(child_id)["lifecycle_state"]
+            == "running"
+        )
+        assert self.dequeue() is None
+
+        audit = self.scheduler.retry_audit()[-1]
+        self.assert_sanitized_audit(audit)
+        assert audit["reason"] == "stale_parent_revision"
+        assert audit["parent_id"] == parent_id
+        assert audit["parent_revision"] == 4
+
+    def test_normal_retry_path_still_requeues_unaffected_tasks(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        task = self.dequeue()
+
+        assert self.scheduler.fail(task["id"])
+        retried = self.dequeue()
+
+        assert retried["id"] == task_id
+        assert retried["type"] == "test"
+        assert retried["retries"] == 1
+        assert retried["attempt"] == 1
+        assert retried["revision"] == 1
+
+    def test_retry_audit_entries_are_bounded(self):
+        task_id = self.scheduler.enqueue({
+            "type": "child",
+            "payload": {"secret": "do-not-audit"},
+        })
+        self.dequeue()
+
+        for _ in range(105):
+            assert not self.scheduler.fail(task_id, expected_attempt=10)
+
+        audit = self.scheduler.retry_audit()
+        assert len(audit) == 100
+        assert audit[-1]["reason"] == "stale_attempt"
+        self.assert_sanitized_audit(audit[-1])
 
 # 2019-01-09T19:07:03 update
 
