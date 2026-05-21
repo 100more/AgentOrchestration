@@ -1,7 +1,8 @@
 """API middleware components."""
 
-import time
 import logging
+import re
+import time
 from typing import Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -10,9 +11,75 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+class UploadBoundaryMiddleware(BaseHTTPMiddleware):
+    BOUNDARY_RE = re.compile(r"^[A-Za-z0-9'()+_,\-./:=? ]+$")
+
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        content_type = request.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            request.state.upload_guard = "accepted"
+            try:
+                response = await call_next(request)
+            finally:
+                request.state.upload_guard = None
+            response.headers["X-Upload-Guard"] = "accepted"
+            return response
+
+        boundary = self._extract_boundary(content_type)
+        reason = self._validate_boundary(boundary)
+        if reason:
+            logger.warning("Rejected multipart upload: %s", reason)
+            request.state.upload_guard = "rejected"
+            try:
+                return Response(
+                    status_code=400,
+                    content="Bad Request",
+                    headers={"X-Upload-Guard": "rejected"},
+                )
+            finally:
+                request.state.upload_guard = None
+
+        request.state.upload_guard = "accepted"
+        try:
+            response = await call_next(request)
+        finally:
+            request.state.upload_guard = None
+        response.headers["X-Upload-Guard"] = "accepted"
+        return response
+
+    def _extract_boundary(self, content_type: str) -> str | None:
+        for part in content_type.split(";"):
+            candidate = part.strip()
+            if not candidate.startswith("boundary="):
+                continue
+            boundary = candidate[len("boundary="):].strip()
+            if boundary.startswith('"') and boundary.endswith('"'):
+                boundary = boundary[1:-1]
+            return boundary
+        return None
+
+    def _validate_boundary(self, boundary: str | None) -> str | None:
+        if boundary is None:
+            return "missing boundary"
+        if boundary.strip() == "":
+            return "blank boundary"
+        if len(boundary) > 70:
+            return "boundary too long"
+        if not self.BOUNDARY_RE.fullmatch(boundary):
+            return "boundary contains invalid characters"
+        return None
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +93,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +114,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
