@@ -18,6 +18,8 @@ class RegisterWebhookEndpointRequest(BaseModel):
     signing_secret: Optional[str] = None
     enabled: bool = True
     endpoint_id: Optional[str] = None
+    max_deliveries: int = 100
+    window_seconds: int = 60
 
 
 class RotateWebhookEndpointRequest(BaseModel):
@@ -46,6 +48,8 @@ async def register_webhook_endpoint(
             signing_secret=request.signing_secret,
             enabled=request.enabled,
             endpoint_id=request.endpoint_id,
+            max_deliveries=request.max_deliveries,
+            window_seconds=request.window_seconds,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -107,6 +111,8 @@ async def record_webhook_delivery(
             attempt=request.attempt,
         )
 
+    if record.reason == "endpoint_rate_limited":
+        raise HTTPException(status_code=429, detail=record.callback_payload)
     if record.status == "rejected":
         raise HTTPException(status_code=409, detail=record.callback_payload)
     return record.callback_payload
@@ -127,6 +133,8 @@ async def schedule_webhook_retry(
         endpoint_version=request.endpoint_version,
         attempt=max(request.attempt, 2),
     )
+    if record.reason == "endpoint_rate_limited":
+        raise HTTPException(status_code=429, detail=record.callback_payload)
     if record.status == "rejected":
         raise HTTPException(status_code=409, detail=record.callback_payload)
     return record.callback_payload

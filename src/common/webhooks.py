@@ -1,10 +1,11 @@
-"""Webhook endpoint validation and delivery-log redaction."""
+"""Webhook endpoint validation, fanout controls, and log redaction."""
 
 import copy
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -39,6 +40,8 @@ class WebhookEndpoint:
     url: str
     signing_secret: Optional[str] = None
     enabled: bool = True
+    max_deliveries: int = 100
+    window_seconds: int = 60
     version: int = 1
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -48,6 +51,8 @@ class WebhookEndpoint:
             "id": self.id,
             "url": redact_delivery_value(self.url),
             "enabled": self.enabled,
+            "max_deliveries": self.max_deliveries,
+            "window_seconds": self.window_seconds,
             "version": self.version,
         }
         if include_workspace:
@@ -69,10 +74,11 @@ class DeliveryRecord:
     response: Dict[str, Any]
     endpoint: Dict[str, Any]
     callback_payload: Dict[str, Any]
+    retry_after: Optional[int] = None
     created_at: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        record = {
             "id": self.id,
             "workspace_id": self.workspace_id,
             "endpoint_id": self.endpoint_id,
@@ -87,18 +93,96 @@ class DeliveryRecord:
             "callback_payload": copy.deepcopy(self.callback_payload),
             "created_at": self.created_at,
         }
+        if self.retry_after is not None:
+            record["retry_after"] = self.retry_after
+        return record
+
+
+DeliverySender = Callable[
+    [WebhookEndpoint, Dict[str, Any]],
+    Optional[Dict[str, Any]],
+]
+
+
+class EndpointRateLimiter:
+    """Workspace and endpoint scoped sliding-window limiter.
+
+    Each event is charged at most once per endpoint. Retry attempts for the
+    same event can reuse the original charge, which keeps retry scheduling
+    idempotent and prevents double-counting against the bucket.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+        self._hits: Dict[Tuple[str, str], List[Tuple[float, str]]] = {}
+        self._charged_events: Set[Tuple[str, str, str]] = set()
+
+    def allow(
+        self,
+        endpoint: WebhookEndpoint,
+        event_id: str,
+    ) -> Tuple[bool, Optional[int]]:
+        now = self._clock()
+        bucket_key = (endpoint.workspace_id, endpoint.id)
+        event_key = (endpoint.workspace_id, endpoint.id, event_id)
+
+        if event_key in self._charged_events:
+            self._hits[bucket_key] = self._active_hits(
+                bucket_key,
+                endpoint.window_seconds,
+                now,
+            )
+            return True, None
+
+        hits = self._active_hits(bucket_key, endpoint.window_seconds, now)
+        if len(hits) >= endpoint.max_deliveries:
+            retry_after = endpoint.window_seconds - (now - hits[0][0])
+            self._hits[bucket_key] = hits
+            return False, max(1, math.ceil(retry_after))
+
+        self._hits[bucket_key] = [*hits, (now, event_id)]
+        self._charged_events.add(event_key)
+        return True, None
+
+    def reset(self) -> None:
+        self._hits.clear()
+        self._charged_events.clear()
+
+    def _active_hits(
+        self,
+        bucket_key: Tuple[str, str],
+        window_seconds: int,
+        now: float,
+    ) -> List[Tuple[float, str]]:
+        window_start = now - window_seconds
+        return [
+            hit for hit in self._hits.get(bucket_key, [])
+            if hit[0] > window_start
+        ]
 
 
 class WebhookDeliveryService:
-    """In-memory guard for webhook delivery records.
+    """In-memory guard for webhook delivery dispatch and records.
 
     The service validates endpoint scope before delivery, persists only
-    sanitized records, and returns sanitized callback-shaped payloads.
+    sanitized records, returns sanitized callback-shaped payloads, and applies
+    rate limits before fanout performs delivery work.
     """
 
-    def __init__(self) -> None:
-        self._endpoints: Dict[str, WebhookEndpoint] = {}
+    def __init__(
+        self,
+        delivery_sender: Optional[DeliverySender] = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self._delivery_sender = delivery_sender or self._default_sender
+        self._endpoints: Dict[Tuple[str, str], WebhookEndpoint] = {}
         self._records: Dict[Tuple[str, str, str, int], DeliveryRecord] = {}
+        self._limiter = EndpointRateLimiter(clock)
+
+    def reset(self) -> None:
+        self._endpoints.clear()
+        self._records.clear()
+        self._limiter.reset()
 
     def register_endpoint(
         self,
@@ -107,20 +191,36 @@ class WebhookDeliveryService:
         signing_secret: Optional[str] = None,
         enabled: bool = True,
         endpoint_id: Optional[str] = None,
+        max_deliveries: int = 100,
+        window_seconds: int = 60,
     ) -> WebhookEndpoint:
         self._validate_url(url)
+        if max_deliveries < 1:
+            raise ValueError("max_deliveries must be at least 1")
+        if window_seconds < 1:
+            raise ValueError("window_seconds must be at least 1")
+
         endpoint = WebhookEndpoint(
             id=endpoint_id or str(uuid.uuid4()),
             workspace_id=workspace_id,
             url=url,
             signing_secret=signing_secret,
             enabled=enabled,
+            max_deliveries=max_deliveries,
+            window_seconds=window_seconds,
         )
-        self._endpoints[endpoint.id] = endpoint
+        key = (endpoint.workspace_id, endpoint.id)
+        if key in self._endpoints:
+            raise ValueError("Webhook endpoint already exists")
+        self._endpoints[key] = endpoint
         return copy.deepcopy(endpoint)
 
-    def disable_endpoint(self, endpoint_id: str) -> bool:
-        endpoint = self._endpoints.get(endpoint_id)
+    def disable_endpoint(
+        self,
+        endpoint_id: str,
+        workspace_id: Optional[str] = None,
+    ) -> bool:
+        endpoint = self._find_endpoint_for_update(endpoint_id, workspace_id)
         if not endpoint:
             return False
         endpoint.enabled = False
@@ -131,14 +231,42 @@ class WebhookDeliveryService:
         self,
         endpoint_id: str,
         signing_secret: Optional[str] = None,
+        workspace_id: Optional[str] = None,
     ) -> Optional[WebhookEndpoint]:
-        endpoint = self._endpoints.get(endpoint_id)
+        endpoint = self._find_endpoint_for_update(endpoint_id, workspace_id)
         if not endpoint:
             return None
         endpoint.version += 1
         endpoint.signing_secret = signing_secret
         endpoint.updated_at = time.time()
         return copy.deepcopy(endpoint)
+
+    def fanout(
+        self,
+        workspace_id: str,
+        event_id: str,
+        payload: Dict[str, Any],
+        endpoint_ids: Optional[Iterable[str]] = None,
+        headers: Optional[Dict[str, Any]] = None,
+        attempt: int = 1,
+    ) -> List[DeliveryRecord]:
+        if endpoint_ids is None:
+            endpoint_ids = [
+                endpoint.id for endpoint in self._endpoints.values()
+                if endpoint.workspace_id == workspace_id
+            ]
+
+        return [
+            self.deliver(
+                workspace_id=workspace_id,
+                endpoint_id=endpoint_id,
+                event_id=event_id,
+                payload=payload,
+                headers=headers,
+                attempt=attempt,
+            )
+            for endpoint_id in endpoint_ids
+        ]
 
     def deliver(
         self,
@@ -253,19 +381,15 @@ class WebhookDeliveryService:
         if key in self._records:
             return copy.deepcopy(self._records[key])
 
-        endpoint = self._endpoints.get(endpoint_id)
+        endpoint = self._endpoints.get((workspace_id, endpoint_id))
         status = requested_status
         reason = requested_reason
         include_endpoint_workspace = True
+        retry_after: Optional[int] = None
 
         if endpoint is None:
             status = "rejected"
             reason = "endpoint_not_found"
-            endpoint_info = {"id": endpoint_id}
-        elif endpoint.workspace_id != workspace_id:
-            status = "rejected"
-            reason = "workspace_mismatch"
-            include_endpoint_workspace = False
             endpoint_info = {"id": endpoint_id}
         else:
             if not endpoint.enabled:
@@ -284,6 +408,22 @@ class WebhookDeliveryService:
         sanitized_payload = redact_delivery_value(payload)
         sanitized_headers = sanitize_headers(headers)
         sanitized_response = redact_delivery_value(response or {})
+
+        if endpoint is not None and status != "rejected":
+            allowed, retry_after = self._limiter.allow(endpoint, event_id)
+            if not allowed:
+                status = "rejected"
+                reason = "endpoint_rate_limited"
+            elif requested_status == "delivered":
+                sender_response = self._delivery_sender(
+                    copy.deepcopy(endpoint),
+                    copy.deepcopy(sanitized_payload),
+                )
+                if sender_response is not None:
+                    sanitized_response = redact_delivery_value(
+                        sender_response
+                    )
+
         callback_payload = {
             "endpoint_id": endpoint_id,
             "event_id": event_id,
@@ -293,8 +433,9 @@ class WebhookDeliveryService:
             "payload": copy.deepcopy(sanitized_payload),
             "response": copy.deepcopy(sanitized_response),
         }
-        if reason != "workspace_mismatch":
-            callback_payload["endpoint"] = copy.deepcopy(endpoint_info)
+        if retry_after is not None:
+            callback_payload["retry_after"] = retry_after
+        callback_payload["endpoint"] = copy.deepcopy(endpoint_info)
 
         record = DeliveryRecord(
             id=str(uuid.uuid4()),
@@ -309,9 +450,33 @@ class WebhookDeliveryService:
             response=sanitized_response,
             endpoint=endpoint_info,
             callback_payload=callback_payload,
+            retry_after=retry_after,
         )
         self._records[key] = record
         return copy.deepcopy(record)
+
+    def _find_endpoint_for_update(
+        self,
+        endpoint_id: str,
+        workspace_id: Optional[str],
+    ) -> Optional[WebhookEndpoint]:
+        if workspace_id is not None:
+            return self._endpoints.get((workspace_id, endpoint_id))
+
+        matches = [
+            endpoint for endpoint in self._endpoints.values()
+            if endpoint.id == endpoint_id
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    @staticmethod
+    def _default_sender(
+        endpoint: WebhookEndpoint,
+        payload: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        return None
 
     @staticmethod
     def _validate_url(url: str) -> None:
