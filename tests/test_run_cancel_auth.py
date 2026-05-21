@@ -286,6 +286,17 @@ def test_introspect_uses_sub_ref_not_raw_sub():
     assert token.sub not in str(result)
 
 
+def test_introspect_uses_workspace_ref_not_raw_workspace():
+    svc = fresh_service()
+    token = valid_token(workspace=WORKSPACE)
+
+    result = svc.introspect(token)
+
+    assert result["workspace_ref"] == _principal_ref(token.workspace_id)
+    assert "workspace_id" not in result
+    assert token.workspace_id not in str(result)
+
+
 def test_every_audit_entry_has_exact_schema():
     svc = fresh_service()
 

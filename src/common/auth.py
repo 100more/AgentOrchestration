@@ -68,7 +68,7 @@ class OperatorAuthService:
         return {
             "active": active,
             "scope": " ".join(token.scopes),
-            "workspace_id": token.workspace_id,
+            "workspace_ref": _principal_ref(token.workspace_id),
             "role": self._roles.get(token.sub, token.role),
             "exp": token.exp,
             "sub_ref": _principal_ref(token.sub),
