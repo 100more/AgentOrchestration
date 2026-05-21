@@ -8,6 +8,7 @@ from uuid import uuid4
 
 CANCELLED_LIFECYCLES = {"cancelled", "canceled", "cancelling", "canceling"}
 RETRY_AUDIT_LIMIT = 100
+CANCEL_AUDIT_LIMIT = 100
 
 
 class PriorityQueue:
@@ -36,10 +37,11 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._task_state: Dict[str, Dict[str, Any]] = {}
         self._retry_audit: List[Dict[str, Any]] = []
+        self._cancel_audit: List[Dict[str, Any]] = []
         self._max_retries = 3
 
     def enqueue(
@@ -66,6 +68,8 @@ class TaskScheduler:
         queue: str = "default",
         priority: int = 0,
     ) -> None:
+        task["queue"] = queue
+        task["priority"] = priority
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
@@ -77,9 +81,25 @@ class TaskScheduler:
         queue: str = "default",
         priority: int = 0,
     ) -> str:
-        task_id = str(uuid4())
+        now = time.time()
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["queue"] = queue
+        task["priority"] = priority
+        task["scheduled_at"] = now
+        task["due_at"] = now + delay
+        task.setdefault("retries", 0)
+        task.setdefault("attempt", task["retries"])
+        task.setdefault("revision", 0)
+        task.setdefault("lifecycle_state", "scheduled")
+
+        self._record_task_state(task_id, task)
+        self._scheduled[task_id] = {
+            "task": task,
+            "due_at": task["due_at"],
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
     async def dequeue(
@@ -88,11 +108,22 @@ class TaskScheduler:
         timeout: float = 1.0,
     ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid for tid, scheduled in self._scheduled.items()
+            if scheduled["due_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
+            scheduled = self._scheduled.pop(tid)
+            task = scheduled["task"]
             if task:
-                self.enqueue(task, queue)
+                task["enqueued_at"] = now
+                task["lifecycle_state"] = "queued"
+                self._record_task_state(tid, task)
+                self._push_task(
+                    task,
+                    scheduled["queue"],
+                    scheduled["priority"],
+                )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -114,14 +145,21 @@ class TaskScheduler:
     def cancel(self, task_id: str) -> bool:
         task = self._in_flight.pop(task_id, None)
         if task is not None:
+            if self._is_cancelled(task.get("lifecycle_state")):
+                self._in_flight[task_id] = task
+                return True
             task["lifecycle_state"] = "cancelled"
             self._record_task_state(task_id, task)
+            self._record_cancel_audit(task_id, task)
             return True
 
         state = self._task_state.get(task_id)
         if state is None:
             return False
+        if self._is_cancelled(state.get("lifecycle_state")):
+            return True
         state["lifecycle_state"] = "cancelled"
+        self._record_cancel_audit(task_id, state)
         return True
 
     def fail(
@@ -170,6 +208,9 @@ class TaskScheduler:
     def retry_audit(self) -> List[Dict[str, Any]]:
         return [dict(record) for record in self._retry_audit]
 
+    def cancel_audit(self) -> List[Dict[str, Any]]:
+        return [dict(record) for record in self._cancel_audit]
+
     def _retry_rejection_reason(
         self,
         task: Optional[Dict],
@@ -206,6 +247,8 @@ class TaskScheduler:
         if parent_state and self._is_cancelled(
             parent_state.get("lifecycle_state"),
         ):
+            if parent_state.get("parent_id") is not None:
+                return "ancestor_cancelled"
             return "parent_cancelled"
 
         expected_parent_attempt = self._first_not_none(
@@ -234,7 +277,11 @@ class TaskScheduler:
         reason: str,
         parent_lifecycle: Optional[str],
     ) -> None:
-        if reason in {"parent_cancelled", "task_cancelled"}:
+        if reason in {
+            "ancestor_cancelled",
+            "parent_cancelled",
+            "task_cancelled",
+        }:
             self._in_flight.pop(task["id"], None)
             task["lifecycle_state"] = "cancelled"
             self._record_task_state(task["id"], task)
@@ -246,7 +293,19 @@ class TaskScheduler:
             "revision": task.get("revision"),
             "retries": task.get("retries"),
             "lifecycle_state": task.get("lifecycle_state"),
+            "parent_id": self._parent_id(task),
         }
+
+    def _record_cancel_audit(self, task_id: str, task: Dict) -> None:
+        self._cancel_audit.append({
+            "decision": "task_cancelled",
+            "reason": "cancelled",
+            "task_id": task_id,
+            "attempt": task.get("attempt"),
+            "revision": task.get("revision"),
+            "lifecycle_state": task.get("lifecycle_state"),
+        })
+        self._cancel_audit = self._cancel_audit[-CANCEL_AUDIT_LIMIT:]
 
     def _record_retry_audit(
         self,

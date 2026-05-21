@@ -2,7 +2,8 @@ import asyncio
 
 import pytest
 
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator import scheduler as scheduler_module
+from src.orchestrator.scheduler import CANCELLED_LIFECYCLES, TaskScheduler
 
 
 AUDIT_KEYS = {
@@ -60,6 +61,52 @@ class TestTaskScheduler:
         task = self.dequeue()
         assert self.scheduler.fail(task["id"])
 
+    def test_scheduled_task_promotion_preserves_identity_queue_and_priority(
+        self,
+        monkeypatch,
+    ):
+        now = 1000.0
+        monkeypatch.setattr(scheduler_module.time, "time", lambda: now)
+
+        task_id = self.scheduler.schedule(
+            {"id": "sched-task-001", "type": "scheduled"},
+            delay=5,
+            queue="high-priority",
+            priority=1,
+        )
+        assert task_id == "sched-task-001"
+
+        now = 1006.0
+        task = asyncio.run(self.scheduler.dequeue(queue="high-priority"))
+
+        assert task["id"] == "sched-task-001"
+        assert task["queue"] == "high-priority"
+        assert task["priority"] == 1
+
+    def test_cancel_is_idempotent_and_audited_once(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        task = self.dequeue()
+
+        assert self.scheduler.cancel(task["id"])
+        after_first_cancel = self.scheduler.get_task_state(task_id)
+        assert after_first_cancel["lifecycle_state"] == "cancelled"
+
+        assert self.scheduler.cancel(task_id)
+        assert self.scheduler.get_task_state(task_id) == after_first_cancel
+        assert len(self.scheduler.cancel_audit()) == 1
+
+    @pytest.mark.parametrize("lifecycle", sorted(CANCELLED_LIFECYCLES))
+    def test_cancelled_lifecycle_cancel_is_a_noop(self, lifecycle):
+        task_id = self.scheduler.enqueue({
+            "type": "test",
+            "lifecycle_state": lifecycle,
+        })
+        before = self.scheduler.get_task_state(task_id)
+
+        assert self.scheduler.cancel(task_id)
+        assert self.scheduler.get_task_state(task_id) == before
+        assert self.scheduler.cancel_audit() == []
+
     def test_parent_cancelled_before_child_failure_rejects_child_retry(self):
         parent_id = self.scheduler.enqueue({"type": "parent"})
         parent = self.dequeue()
@@ -91,6 +138,38 @@ class TestTaskScheduler:
         assert audit["reason"] == "parent_cancelled"
         assert audit["task_id"] == child_id
         assert audit["parent_id"] == parent_id
+        assert audit["parent_lifecycle_state"] == "cancelled"
+
+    def test_cancelled_ancestor_rejects_grandchild_retry(self):
+        parent_id = self.scheduler.enqueue({"type": "parent"})
+        parent = self.dequeue()
+        assert parent["id"] == parent_id
+
+        child_id = self.scheduler.enqueue({
+            "type": "child",
+            "parent_id": parent_id,
+        })
+        child = self.dequeue()
+        assert child["id"] == child_id
+
+        grandchild_id = self.scheduler.enqueue({
+            "type": "grandchild",
+            "parent_id": child_id,
+            "payload": {"secret": "do-not-audit"},
+        })
+        grandchild = self.dequeue()
+        assert grandchild["id"] == grandchild_id
+
+        assert self.scheduler.cancel(parent_id)
+        assert self.scheduler.cancel(child_id)
+        assert not self.scheduler.fail(grandchild_id)
+        assert self.dequeue() is None
+
+        audit = self.scheduler.retry_audit()[-1]
+        self.assert_sanitized_audit(audit)
+        assert audit["reason"] == "ancestor_cancelled"
+        assert audit["task_id"] == grandchild_id
+        assert audit["parent_id"] == child_id
         assert audit["parent_lifecycle_state"] == "cancelled"
 
     @pytest.mark.parametrize(
