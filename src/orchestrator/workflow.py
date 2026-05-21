@@ -1,8 +1,44 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import hashlib
+import importlib
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+import yaml
+
+
+def _node_ref(node_id: str) -> str:
+    return hashlib.sha256(node_id.encode()).hexdigest()[:12]
+
+
+def _workflow_import_audit_event(
+    *, node_ref: str, decision: str, reason: str
+) -> Dict[str, object]:
+    return {
+        "event": "workflow_yaml_import_node",
+        "node_ref": node_ref,
+        "decision": decision,
+        "reason": reason,
+    }
+
+
+class WorkflowError(ValueError):
+    pass
+
+
+class DuplicateNodeError(ValueError):
+    def __init__(self, node_id: str, context: str = ""):
+        self.node_id_ref = _node_ref(node_id)
+        if context:
+            message = (
+                f"duplicate node identifier in {context}: "
+                f"{self.node_id_ref}"
+            )
+        else:
+            message = f"duplicate node identifier: {self.node_id_ref}"
+        super().__init__(message)
 
 
 class StepStatus(Enum):
@@ -14,7 +50,13 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -33,10 +75,30 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self._node_ids: set[str] = set()
+        self.import_audit_log: List[Dict[str, object]] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
+        node_ref = _node_ref(step.name)
+        if step.name in self._node_ids:
+            self.import_audit_log.append(
+                _workflow_import_audit_event(
+                    node_ref=node_ref,
+                    decision="rejected",
+                    reason="duplicate_node_id",
+                )
+            )
+            raise DuplicateNodeError(step.name)
+        self._node_ids.add(step.name)
         self.steps.append(step)
         self._step_map[step.id] = step
+        self.import_audit_log.append(
+            _workflow_import_audit_event(
+                node_ref=node_ref,
+                decision="accepted",
+                reason="node_registered",
+            )
+        )
         return self
 
     def get_step(self, step_id: str) -> Optional[WorkflowStep]:
@@ -61,6 +123,46 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def register_from_yaml(
+        self,
+        yaml_str: str,
+        import_resolver: Optional[Dict[str, str]] = None,
+    ) -> Workflow:
+        definition = self._load_yaml_definition(yaml_str)
+        workflow_name = str(definition.get("name") or "workflow")
+        description = str(definition.get("description") or "")
+        import_resolver = import_resolver or {}
+
+        imported_nodes: List[Dict[str, object]] = []
+        for import_entry in definition.get("imports", []) or []:
+            import_name, node_filter = self._parse_import_entry(import_entry)
+            if import_name == workflow_name:
+                raise WorkflowError(f"self_import: {import_name}")
+            if import_name not in import_resolver:
+                raise WorkflowError(f"unresolved_import: {import_name}")
+
+            import_definition = self._load_yaml_definition(
+                import_resolver[import_name]
+            )
+            nodes = self._extract_node_definitions(import_definition)
+            if node_filter is not None:
+                allowed = set(node_filter)
+                nodes = [
+                    node for node in nodes
+                    if self._node_name(node) in allowed
+                ]
+            imported_nodes.extend(nodes)
+
+        local_nodes = self._extract_node_definitions(definition)
+        workflow = self.create_workflow(workflow_name, description)
+        try:
+            for node in imported_nodes + local_nodes:
+                workflow.add_step(self._step_from_node(node))
+        except DuplicateNodeError:
+            self.delete_workflow(workflow.id)
+            raise
+        return workflow
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
@@ -81,6 +183,76 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _load_yaml_definition(self, yaml_str: str) -> Dict[str, object]:
+        definition = yaml.safe_load(yaml_str) or {}
+        if not isinstance(definition, dict):
+            raise WorkflowError("invalid_workflow_definition")
+        return definition
+
+    def _parse_import_entry(
+        self, import_entry: object
+    ) -> tuple[str, Optional[List[str]]]:
+        if isinstance(import_entry, str):
+            return import_entry, None
+        if not isinstance(import_entry, dict):
+            raise WorkflowError("invalid_import")
+        import_name = import_entry.get("name")
+        if not isinstance(import_name, str) or not import_name:
+            raise WorkflowError("invalid_import")
+        nodes = import_entry.get("nodes")
+        if nodes is None:
+            return import_name, None
+        if not isinstance(nodes, list):
+            raise WorkflowError("invalid_import")
+        return import_name, [str(node) for node in nodes]
+
+    def _extract_node_definitions(
+        self, definition: Dict[str, object]
+    ) -> List[Dict[str, object]]:
+        raw_nodes = definition.get("steps", definition.get("nodes", [])) or []
+        if not isinstance(raw_nodes, list):
+            raise WorkflowError("invalid_nodes")
+
+        nodes = []
+        for raw_node in raw_nodes:
+            if isinstance(raw_node, str):
+                nodes.append({"id": raw_node})
+            elif isinstance(raw_node, dict):
+                nodes.append(dict(raw_node))
+            else:
+                raise WorkflowError("invalid_node")
+        return nodes
+
+    def _node_name(self, node: Dict[str, object]) -> str:
+        node_name = node.get("id", node.get("name"))
+        if not isinstance(node_name, str) or not node_name:
+            raise WorkflowError("invalid_node")
+        return node_name
+
+    def _step_from_node(self, node: Dict[str, object]) -> WorkflowStep:
+        return WorkflowStep(
+            self._node_name(node),
+            self._resolve_handler(node.get("handler")),
+            retries=int(node.get("retries", 0) or 0),
+            timeout=int(node.get("timeout", 300) or 300),
+        )
+
+    def _resolve_handler(self, handler_ref: object) -> Callable:
+        if callable(handler_ref):
+            return handler_ref
+        if not isinstance(handler_ref, str) or "." not in handler_ref:
+            return lambda: None
+
+        module_name, _, attr_name = handler_ref.rpartition(".")
+        try:
+            module = importlib.import_module(module_name)
+            handler = getattr(module, attr_name)
+        except (ImportError, AttributeError):
+            return lambda: None
+        if not callable(handler):
+            return lambda: None
+        return handler
 
 # 2019-03-27T19:58:07 update
 
